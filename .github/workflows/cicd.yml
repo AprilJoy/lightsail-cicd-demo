@@ -1,0 +1,89 @@
+name: Demo CI/CD
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: lightsail-demo-production
+  cancel-in-progress: false
+
+jobs:
+  test-and-publish:
+    runs-on: ubuntu-latest
+    outputs:
+      image_name: ${{ steps.image.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Choose lowercase image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Test the container through HTTP
+        run: ./scripts/test.sh
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and publish immutable image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            VERSION=${{ github.sha }}
+          tags: ${{ steps.image.outputs.name }}:${{ github.sha }}
+
+  deploy:
+    needs: test-and-publish
+    runs-on: ubuntu-latest
+    environment: production-demo
+    env:
+      IMAGE_NAME: ${{ needs.test-and-publish.outputs.image_name }}
+      IMAGE_TAG: ${{ github.sha }}
+      SSH_HOST: ${{ vars.LIGHTSAIL_HOST }}
+      SSH_USER: ${{ vars.LIGHTSAIL_USER }}
+      SSH_PORT: ${{ vars.LIGHTSAIL_SSH_PORT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.LIGHTSAIL_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "${{ secrets.LIGHTSAIL_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Copy deployment files
+        shell: bash
+        run: |
+          ssh_port="${SSH_PORT:-22}"
+          ssh -p "$ssh_port" "$SSH_USER@$SSH_HOST" 'mkdir -p /opt/cicd-demo/scripts'
+          scp -P "$ssh_port" compose.yaml "$SSH_USER@$SSH_HOST:/opt/cicd-demo/compose.yaml"
+          scp -P "$ssh_port" scripts/deploy.sh "$SSH_USER@$SSH_HOST:/opt/cicd-demo/scripts/deploy.sh"
+
+      - name: Authenticate the server to GHCR and deploy
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ssh_port="${SSH_PORT:-22}"
+          printf '%s' "$GHCR_TOKEN" | ssh -p "$ssh_port" "$SSH_USER@$SSH_HOST" \
+            "docker login ghcr.io -u '$GITHUB_ACTOR' --password-stdin"
+          ssh -p "$ssh_port" "$SSH_USER@$SSH_HOST" \
+            "chmod +x /opt/cicd-demo/scripts/deploy.sh && /opt/cicd-demo/scripts/deploy.sh '$IMAGE_NAME' '$IMAGE_TAG'"
+
