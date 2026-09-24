@@ -1,0 +1,18 @@
+name: lightsail-cicd-demo
+
+services:
+  app:
+    image: ${IMAGE_NAME:-lightsail-cicd-demo}:${IMAGE_TAG:-local}
+    build:
+      context: .
+      args:
+        VERSION: ${IMAGE_TAG:-local}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${HOST_PORT:-18080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
